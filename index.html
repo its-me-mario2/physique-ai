@@ -6,6 +6,7 @@
 <title>PhysiqueAI - Body Physique Analyzer</title>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.21.0/dist/tf.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection@2.1.3/dist/pose-detection.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/body-segmentation@1.1.0/dist/body-segmentation.min.js"></script>
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 :root{--bg:#0a0e1a;--surface:#12182b;--card:#1a2240;--border:#2a3560;--text:#d0d8f0;--text-muted:#8892b0;--accent:#6c63ff;--accent2:#00d4aa;--accent3:#ff6b9d;--danger:#ff4757;--warning:#ffa502;--success:#2ed573;--radius:16px;--shadow:0 8px 32px rgba(0,0,0,.4)}
@@ -246,8 +247,9 @@ PhysiqueAI &mdash; for informational purposes only. Not medical advice.
 </div>
 
 <script>
-// ==================== WEBCAM + AI POSE ====================
-let webcamStream=null;let detector=null;let capturedImageData=null;let bodyShape=null;
+// ==================== WEBCAM + AI BODY MEASUREMENT ====================
+// Uses MoveNet for pose + body segmentation for silhouette-based width measurement
+let webcamStream=null;let detector=null;let segmenter=null;let capturedImageData=null;
 const camBtn=document.getElementById('camBtn');
 const captureBtn=document.getElementById('captureBtn');
 const retakeBtn=document.getElementById('retakeBtn');
@@ -261,13 +263,19 @@ const resultPhotoContainer=document.getElementById('resultPhotoContainer');
 const bodyShapeLabel=document.getElementById('bodyShapeLabel');
 const timerOverlay=document.getElementById('timerOverlay');
 
-async function loadDetector(){
+async function loadModels(){
   try{
     if(!detector&&typeof poseDetection!=='undefined'){
       const model=poseDetection.SupportedModels.MoveNet;
       detector=await poseDetection.createDetector(model,{modelType:poseDetection.movenet.modelType.SINGLEPOSE_LIGHTNING});
     }
   }catch(e){console.warn('Pose detector load failed:',e)}
+  try{
+    if(!segmenter&&typeof bodySegmentation!=='undefined'){
+      const model=bodySegmentation.SupportedModels.MediaPipeSelfieSegmentation;
+      segmenter=await bodySegmentation.createSegmenter(model,{runtime:'tfjs'});
+    }
+  }catch(e){console.warn('Segmenter load failed:',e)}
 }
 
 camBtn.addEventListener('click',async()=>{
@@ -282,7 +290,7 @@ camBtn.addEventListener('click',async()=>{
     retakeBtn.classList.add('hidden');
     capturedPhoto.classList.remove('active');
     capturedImageData=null;
-    loadDetector();
+    loadModels();
   }catch(e){
     poseStatus.textContent='Camera access denied. Please allow camera permissions.';
   }
@@ -315,7 +323,7 @@ captureBtn.addEventListener('click',async()=>{
   if(webcamStream){webcamStream.getTracks().forEach(t=>t.stop());webcamStream=null}
   captureBtn.classList.add('hidden');
   retakeBtn.classList.remove('hidden');
-  poseStatus.textContent='Analyzing body from photo...';
+  poseStatus.textContent='AI analyzing body measurements...';
 
   analyzeBodyFromImage(capturedImageData);
 });
@@ -340,75 +348,114 @@ async function analyzeBodyFromImage(dataUrl){
   const img=new Image();
   img.onload=async()=>{
     try{
-      if(detector){
-        const poses=await detector.estimatePoses(img);
-        if(poses&&poses.length>0&&poses[0].keypoints){
-          const kp=poses[0].keypoints;
-          const kpMap={};
-          kp.forEach(p=>{kpMap[p.name]=p});
-          const required=['nose','left_shoulder','right_shoulder','left_hip','right_hip','left_ankle','right_ankle'];
-          const missing=required.filter(k=>!kpMap[k]||kpMap[k].score<0.3);
-          if(missing.length===0){
-            const height=parseFloat(document.getElementById('height').value);
-            if(!height||height<50){poseStatus.textContent='Enter your height first for accurate AI measurement.';return}
+      const height=parseFloat(document.getElementById('height').value);
+      if(!height||height<50){poseStatus.textContent='Enter your height first for AI measurement.';return}
+      if(!detector){poseStatus.textContent='AI models loading...';setTimeout(()=>analyzeBodyFromImage(dataUrl),2000);return}
 
-            // Measure pixel height of person (nose to ankle midpoint)
-            const ankleY=(kpMap.left_ankle.y+kpMap.right_ankle.y)/2;
-            const pixelHeight=ankleY-kpMap.nose.y;
-            const pxPerCm=pixelHeight/height;
-
-            // Shoulder width in cm
-            const shoulderPx=dist(kpMap.left_shoulder,kpMap.right_shoulder);
-            const shoulderCm=shoulderPx/pxPerCm;
-
-            // Hip width in cm
-            const hipPx=dist(kpMap.left_hip,kpMap.right_hip);
-            const hipCm=hipPx/pxPerCm;
-
-            // Estimate waist: at ~45% of torso, width is ~75-85% of shoulder/hip average
-            const avgWH=(shoulderCm+hipCm)/2;
-            const estWaistCm=avgWH*0.82;
-
-            // Estimate neck from ear-to-shoulder distance
-            let neckCm=14;
-            if(kpMap.left_ear&&kpMap.left_ear.score>0.3&&kpMap.left_shoulder.score>0.3){
-              const neckPx=dist(kpMap.left_ear,kpMap.left_shoulder)*0.6;
-              neckCm=neckPx/pxPerCm;
-            }else if(kpMap.right_ear&&kpMap.right_ear.score>0.3&&kpMap.right_shoulder.score>0.3){
-              const neckPx=dist(kpMap.right_ear,kpMap.right_shoulder)*0.6;
-              neckCm=neckPx/pxPerCm;
-            }
-            neckCm=clamp(neckCm,25,55);
-
-            // Body shape from shoulder-to-hip ratio
-            const s2h=shoulderCm/hipCm;
-            let shape='Rectangle';
-            if(s2h>1.2)shape='Inverted Triangle';
-            else if(s2h>0.95)shape='Athletic';
-            else if(s2h>0.8)shape='Pear';
-            bodyShape=shape;
-
-            // AI-estimated body fat using US Navy method with image-derived measurements
-            const age=parseFloat(document.getElementById('age').value)||25;
-            const bfFromPhoto=estimateBodyFatNavy(height,estWaistCm,neckCm,hipCm);
-            bodyShapeLabel.textContent='Body Shape: '+shape;
-
-            // Store estimated measurements for use in analyze()
-            window._aiMeasurements={shoulderCm,hipCm,estWaistCm,neckCm,bfFromPhoto,bodyShape};
-
-            poseStatus.innerHTML=`AI extracted: shoulders ${shoulderCm.toFixed(1)}cm, hips ${hipCm.toFixed(1)}cm, waist ~${estWaistCm.toFixed(1)}cm &bull; Body fat ~${bfFromPhoto.toFixed(1)}%`;
-
-            // Trigger auto-analysis with AI data
-            analyzeWithAI();
-          }else{
-            poseStatus.textContent='Stand in full body view, facing the camera.';
-          }
-        }else{poseStatus.textContent='No pose detected. Face the camera directly.'}
-      }else{
-        poseStatus.textContent='AI model loading... try again in a moment.';
-        setTimeout(()=>analyzeBodyFromImage(dataUrl),2000);
+      const poses=await detector.estimatePoses(img);
+      if(!poses||!poses[0]||!poses[0].keypoints){poseStatus.textContent='No person detected. Face the camera.';return}
+      const kp=poses[0].keypoints;
+      const kpMap={};kp.forEach(p=>{kpMap[p.name]=p});
+      const needed=['nose','left_shoulder','right_shoulder','left_hip','right_hip','left_ankle','right_ankle','left_ear','right_ear'];
+      if(needed.some(k=>!kpMap[k]||kpMap[k].score<0.3)){
+        poseStatus.textContent='Stand in full body view, facing the camera.';
+        return;
       }
-    }catch(e){poseStatus.textContent='Processing photo...';console.warn(e)}
+
+      // Draw image to canvas for pixel analysis
+      const c=document.createElement('canvas');
+      c.width=img.width;c.height=img.height;
+      const cx=c.getContext('2d');
+      cx.drawImage(img,0,0);
+
+      // Get segmentation mask
+      let mask=null;
+      if(segmenter){
+        try{
+          const seg=await segmenter.segmentPeople(img);
+          if(seg&&seg[0])mask=seg[0].maskValue;
+        }catch(e){console.warn('Segmentation failed, using pose-only:',e)}
+      }
+
+      // Pixel height: nose to ankle midpoint
+      const ankleY=(kpMap.left_ankle.y+kpMap.right_ankle.y)/2;
+      const pixelHeight=ankleY-kpMap.nose.y;
+      if(pixelHeight<50){poseStatus.textContent='Move further from the camera.';return}
+      const pxPerCm=pixelHeight/height;
+
+      // Shoulder Y, hip Y for reference
+      const shoulderY=(kpMap.left_shoulder.y+kpMap.right_shoulder.y)/2;
+      const hipY=(kpMap.left_hip.y+kpMap.right_hip.y)/2;
+
+      // Measure body widths at different heights using the segmentation mask
+      // Fallback to keypoint-based width if no mask
+      let shoulderW=dist(kpMap.left_shoulder,kpMap.right_shoulder);
+      let waistW=(shoulderW+dist(kpMap.left_hip,kpMap.right_hip))/2*0.82;
+      let hipW=dist(kpMap.left_hip,kpMap.right_hip);
+
+      if(mask){
+        // Extract actual widths from segmentation mask
+        const h=mask.length;const w=mask[0].length;
+        const bodyCenterX=(kpMap.left_shoulder.x+kpMap.right_shoulder.x+kpMap.left_hip.x+kpMap.right_hip.x)/4;
+
+        function scanWidthAt(yNorm){
+          const y=Math.round(yNorm);
+          if(y<0||y>=h)return 0;
+          // Find leftmost person pixel
+          let left=0;let right=w-1;
+          for(let x=Math.round(bodyCenterX);x>=0;x--){if(mask[y][x]>0.5){left=x;break}}
+          for(let x=Math.round(bodyCenterX);x<w;x++){if(mask[y][x]>0.5){right=x;break}}
+          return right-left;
+        }
+
+        const shW=scanWidthAt(shoulderY);
+        const hW=scanWidthAt(hipY);
+        // Waist: scan at multiple points between shoulder and hip, take narrowest
+        let minWaistW=Infinity;
+        for(let t=0.35;t<=0.65;t+=0.05){
+          const y=shoulderY+(hipY-shoulderY)*t;
+          const ww=scanWidthAt(y);
+          if(ww>0&&ww<minWaistW)minWaistW=ww;
+        }
+
+        if(shW>10){shoulderW=shW}
+        if(hW>10){hipW=hW}
+        if(minWaistW>10&&minWaistW<Infinity){waistW=minWaistW}
+      }
+
+      // Convert pixels to cm
+      const shoulderCm=shoulderW/pxPerCm;
+      const hipCm=hipW/pxPerCm;
+      const estWaistCm=waistW/pxPerCm;
+
+      // Neck from ear-to-shoulder
+      let neckCm=14;
+      if(kpMap.left_ear&&kpMap.left_ear.score>0.3){
+        const n=dist(kpMap.left_ear,kpMap.left_shoulder)*0.55/pxPerCm;
+        if(n>20&&n<60)neckCm=n;
+      }else if(kpMap.right_ear&&kpMap.right_ear.score>0.3){
+        const n=dist(kpMap.right_ear,kpMap.right_shoulder)*0.55/pxPerCm;
+        if(n>20&&n<60)neckCm=n;
+      }
+      neckCm=clamp(neckCm,25,55);
+
+      // Body shape from shoulder-to-hip ratio
+      const s2h=shoulderCm/hipCm;
+      let shape='Rectangle';
+      if(s2h>1.2)shape='Inverted Triangle';
+      else if(s2h>0.95)shape='Athletic';
+      else if(s2h>0.8)shape='Pear';
+
+      // Body fat using US Navy formula with image-measured values
+      const bfFromPhoto=estimateBodyFatNavy(height,estWaistCm,neckCm,hipCm);
+
+      bodyShapeLabel.textContent='Shape: '+shape;
+      const source=mask?'silhouette scan':'keypoint estimate';
+      poseStatus.innerHTML=`AI (${source}): shoulders ${shoulderCm.toFixed(1)}cm, waist ${estWaistCm.toFixed(1)}cm, hips ${hipCm.toFixed(1)}cm &bull; BF ${bfFromPhoto.toFixed(1)}%`;
+
+      window._aiMeasurements={shoulderCm,hipCm,estWaistCm,neckCm,bfFromPhoto,bodyShape:shape};
+      analyzeWithAI();
+    }catch(e){poseStatus.textContent='Processing...';console.warn(e)}
   };
   img.src=dataUrl;
 }
@@ -416,8 +463,6 @@ async function analyzeBodyFromImage(dataUrl){
 function dist(a,b){return Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2)}
 
 function estimateBodyFatNavy(height,waist,neck,hip){
-  // Uses BMI-based formula since we can't reliably measure all Navy method inputs
-  // from a single front-facing photo (neck circumference is approximate)
   const bf=495/(1.0324-0.19077*Math.log10(waist-neck)+0.15456*Math.log10(height))-450;
   return clamp(bf,5,50);
 }
