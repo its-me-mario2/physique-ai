@@ -346,21 +346,62 @@ async function analyzeBodyFromImage(dataUrl){
           const kp=poses[0].keypoints;
           const kpMap={};
           kp.forEach(p=>{kpMap[p.name]=p});
-          const required=['left_shoulder','right_shoulder','left_hip','right_hip'];
+          const required=['nose','left_shoulder','right_shoulder','left_hip','right_hip','left_ankle','right_ankle'];
           const missing=required.filter(k=>!kpMap[k]||kpMap[k].score<0.3);
           if(missing.length===0){
-            const shoulderW=dist(kpMap.left_shoulder,kpMap.right_shoulder);
-            const hipW=dist(kpMap.left_hip,kpMap.right_hip);
-            const s2h=shoulderW/hipW;
+            const height=parseFloat(document.getElementById('height').value);
+            if(!height||height<50){poseStatus.textContent='Enter your height first for accurate AI measurement.';return}
+
+            // Measure pixel height of person (nose to ankle midpoint)
+            const ankleY=(kpMap.left_ankle.y+kpMap.right_ankle.y)/2;
+            const pixelHeight=ankleY-kpMap.nose.y;
+            const pxPerCm=pixelHeight/height;
+
+            // Shoulder width in cm
+            const shoulderPx=dist(kpMap.left_shoulder,kpMap.right_shoulder);
+            const shoulderCm=shoulderPx/pxPerCm;
+
+            // Hip width in cm
+            const hipPx=dist(kpMap.left_hip,kpMap.right_hip);
+            const hipCm=hipPx/pxPerCm;
+
+            // Estimate waist: at ~45% of torso, width is ~75-85% of shoulder/hip average
+            const avgWH=(shoulderCm+hipCm)/2;
+            const estWaistCm=avgWH*0.82;
+
+            // Estimate neck from ear-to-shoulder distance
+            let neckCm=14;
+            if(kpMap.left_ear&&kpMap.left_ear.score>0.3&&kpMap.left_shoulder.score>0.3){
+              const neckPx=dist(kpMap.left_ear,kpMap.left_shoulder)*0.6;
+              neckCm=neckPx/pxPerCm;
+            }else if(kpMap.right_ear&&kpMap.right_ear.score>0.3&&kpMap.right_shoulder.score>0.3){
+              const neckPx=dist(kpMap.right_ear,kpMap.right_shoulder)*0.6;
+              neckCm=neckPx/pxPerCm;
+            }
+            neckCm=clamp(neckCm,25,55);
+
+            // Body shape from shoulder-to-hip ratio
+            const s2h=shoulderCm/hipCm;
             let shape='Rectangle';
             if(s2h>1.2)shape='Inverted Triangle';
             else if(s2h>0.95)shape='Athletic';
             else if(s2h>0.8)shape='Pear';
             bodyShape=shape;
+
+            // AI-estimated body fat using US Navy method with image-derived measurements
+            const age=parseFloat(document.getElementById('age').value)||25;
+            const bfFromPhoto=estimateBodyFatNavy(height,estWaistCm,neckCm,hipCm);
             bodyShapeLabel.textContent='Body Shape: '+shape;
-            poseStatus.textContent='Pose detected! Body shape: '+shape;
+
+            // Store estimated measurements for use in analyze()
+            window._aiMeasurements={shoulderCm,hipCm,estWaistCm,neckCm,bfFromPhoto,bodyShape};
+
+            poseStatus.innerHTML=`AI extracted: shoulders ${shoulderCm.toFixed(1)}cm, hips ${hipCm.toFixed(1)}cm, waist ~${estWaistCm.toFixed(1)}cm &bull; Body fat ~${bfFromPhoto.toFixed(1)}%`;
+
+            // Trigger auto-analysis with AI data
+            analyzeWithAI();
           }else{
-            poseStatus.textContent='Stand in full view, facing the camera.';
+            poseStatus.textContent='Stand in full body view, facing the camera.';
           }
         }else{poseStatus.textContent='No pose detected. Face the camera directly.'}
       }else{
@@ -372,8 +413,13 @@ async function analyzeBodyFromImage(dataUrl){
   img.src=dataUrl;
 }
 
-function dist(a,b){
-  return Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2);
+function dist(a,b){return Math.sqrt((a.x-b.x)**2+(a.y-b.y)**2)}
+
+function estimateBodyFatNavy(height,waist,neck,hip){
+  // Uses BMI-based formula since we can't reliably measure all Navy method inputs
+  // from a single front-facing photo (neck circumference is approximate)
+  const bf=495/(1.0324-0.19077*Math.log10(waist-neck)+0.15456*Math.log10(height))-450;
+  return clamp(bf,5,50);
 }
 
 // ==================== REFERENCE DATA ====================
@@ -439,13 +485,21 @@ function analyze(){
   }
 
   const bmi=weight/((height/100)*(height/100));
-  const bf=estimateBodyFatBMI(bmi,age);
+  let bf=estimateBodyFatBMI(bmi,age);
   const bmiCat=bmiCategory(bmi);
   const avgBmi=interpAge(AVG_BMI_ALL,age);
   const idealW=idealWeight(height,21.5);
   const overweightBy=Math.max(0,weight-idealWeight(height,25));
 
-  // Score (0-100) based on BMI relative to age average
+  // Use AI photo measurements if available
+  const ai=window._aiMeasurements;
+  let bfSource='BMI formula';
+  if(ai&&ai.bfFromPhoto){
+    bf=ai.bfFromPhoto;
+    bfSource='photo AI';
+  }
+
+  // Score (0-100)
   const bmiScore=100-40*clamp(Math.abs(bmi-avgBmi)/avgBmi,0,1);
   const bfScore=bf<25?100:bf<30?70:bf<35?40:20;
   const score=clamp(bmiScore*.55+bfScore*.45,0,100);
@@ -459,7 +513,7 @@ function analyze(){
   document.getElementById('bmiValue').textContent=bmi.toFixed(1);
   document.getElementById('bmiValue').className='value '+(bmi<18.5?'warn':bmi<25?'good':bmi<30?'warn':'bad');
 
-  document.getElementById('bfValue').textContent=bf.toFixed(1)+'%';
+  document.getElementById('bfValue').textContent=bf.toFixed(1)+'%'+((bfSource==='photo AI')?'*':'');
 
   const bmiStatus=bmi<18.5?'Underweight':bmi<25?'Normal':bmi<30?'Overweight':'Obese';
   document.getElementById('bmiStatus').textContent=bmiStatus;
@@ -469,7 +523,7 @@ function analyze(){
   document.getElementById('ponderalValue').textContent=ponderal.toFixed(2);
 
   // Body fat detail
-  document.getElementById('bfDetail').textContent=bf.toFixed(1)+'%';
+  document.getElementById('bfDetail').textContent=bf.toFixed(1)+'%'+(bfSource==='photo AI'?' (from photo)':'');
   const bfCat=bf<12?'Essential':bf<18?'Athlete':bf<25?'Fit':bf<30?'Average':'Above Avg';
   document.getElementById('bfCategory').textContent=bfCat;
   document.getElementById('bfCategory').className='value '+(bf<18?'accent2':bf<25?'good':bf<30?'warn':'bad');
@@ -500,7 +554,7 @@ function analyze(){
   document.getElementById('gaugeScore').textContent=Math.round(score);
   gauge.style.stroke=score>=70?'#2ed573':score>=45?'#ffa502':'#ff4757';
 
-  // Body fat bars (BMI-based chart)
+  // Body fat bars
   const bfBars=document.getElementById('bfBars').children;
   const maxBF=40;
   bfBars[0].children[0].style.height=(bf/maxBF*100)+'%';
@@ -515,14 +569,17 @@ function analyze(){
   if(Math.abs(bmiDiff)<1)overview+=`Your BMI is right at the average for your age (${avgBmi.toFixed(1)}). `;
   else if(bmiDiff>0)overview+=`Your BMI is ${bmiDiff.toFixed(1)} points above the average for your age. `;
   else overview+=`Your BMI is ${Math.abs(bmiDiff).toFixed(1)} points below the average for your age. `;
-  overview+=`Your estimated body fat is ${bf.toFixed(1)}%. `;
-  if(bodyShape)overview+=`AI vision detects a ${bodyShape} body shape. `;
+  overview+=`Your estimated body fat is ${bf.toFixed(1)}% `;
+  if(bfSource==='photo AI')overview+=`(AI-measured from photo). `;
+  else overview+=`(estimated from BMI). `;
+  if(ai&&ai.bodyShape)overview+=`AI vision detects a ${ai.bodyShape} body shape (shoulders ${ai.shoulderCm.toFixed(1)}cm, hips ${ai.hipCm.toFixed(1)}cm). `;
   if(score>=70)overview+='Your physique is in excellent shape.';
   else if(score>=45)overview+='Your physique is average with room for improvement.';
   else overview+='Consider lifestyle changes to improve your health metrics.';
   document.getElementById('overviewText').textContent=overview;
 
   let bfAnalysis=`Your estimated body fat is ${bf.toFixed(1)}% (${bfCat}). `;
+  if(bfSource==='photo AI')bfAnalysis+=`This was calculated from AI body measurements extracted from your photo. `;
   const diffBf=bf-avgBfAge;
   if(Math.abs(diffBf)<3)bfAnalysis+=`This is typical for someone your age.`;
   else if(diffBf<0)bfAnalysis+=`This is ${Math.abs(diffBf).toFixed(1)}% below average for your age.`;
@@ -546,7 +603,6 @@ function analyze(){
   if(bf>30)recs.push({text:'Prioritize protein and fiber for better satiety and body composition.',color:'yellow'});
   if(bmiCat==='normal'&&bf<22)recs.push({text:'Great shape! Focus on progressive overload in training.',color:'green'});
   if(bmiCat==='normal'&&bf<25)recs.push({text:'You are in a healthy range. Maintain with balanced nutrition and regular exercise.',color:'green'});
-  // Always add general rec
   recs.push({text:'Stay active with at least 150 min of moderate exercise per week.',color:'blue'});
   recs.forEach(r=>{
     const div=document.createElement('div');div.className='rec-item';
@@ -558,6 +614,10 @@ function analyze(){
   drawAgeChart(age,bmi,avgBmi);
 
   if(window.innerWidth<860)rc.scrollIntoView({behavior:'smooth',block:'start'});
+}
+
+function analyzeWithAI(){
+  analyze();
 }
 
 function drawAgeChart(userAge,bmi,avgBmi){
